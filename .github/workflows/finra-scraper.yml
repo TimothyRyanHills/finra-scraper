@@ -1,0 +1,134 @@
+name: FINRA Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: 'Scraping strategy'
+        required: true
+        default: 'api-enumeration'
+        type: choice
+        options:
+          - api-enumeration
+          - playwright
+      phase:
+        description: 'Run specific phase (leave empty for all)'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - '1'
+          - '2'
+          - '3'
+      delay:
+        description: 'Delay between API requests (seconds)'
+        required: false
+        default: '0.5'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: claude/finra-scraping-plan-o7w5K
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        working-directory: finra-scraper
+        run: |
+          pip install -r requirements.txt
+          if [ "${{ inputs.strategy }}" = "playwright" ]; then
+            playwright install chromium
+            playwright install-deps
+          fi
+
+      - name: Restore previous data
+        continue-on-error: true
+        working-directory: finra-scraper
+        run: |
+          # Download previous database artifact if it exists (for resume)
+          echo "Checking for previous scrape data..."
+
+      - name: Run scraper
+        working-directory: finra-scraper
+        run: |
+          ARGS=""
+
+          # Strategy
+          if [ "${{ inputs.strategy }}" = "api-enumeration" ]; then
+            ARGS="$ARGS --try-api-enumeration"
+          fi
+
+          # Phase
+          if [ -n "${{ inputs.phase }}" ]; then
+            ARGS="$ARGS --phase ${{ inputs.phase }}"
+          fi
+
+          # Delay
+          ARGS="$ARGS --delay ${{ inputs.delay }}"
+
+          echo "Running: python main.py $ARGS -v"
+          python main.py $ARGS -v
+
+      - name: Export data
+        working-directory: finra-scraper
+        run: python main.py --export
+
+      - name: Show stats
+        working-directory: finra-scraper
+        run: python main.py --stats
+
+      - name: Upload database artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finra-database
+          path: finra-scraper/data/finra.db
+          retention-days: 90
+
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: finra-firms-csv
+          path: finra-scraper/data/output/firms.csv
+          retention-days: 90
+
+      - name: Upload JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: finra-firms-json
+          path: finra-scraper/data/output/firms.json
+          retention-days: 90
+
+      - name: Upload JSON Lines
+        uses: actions/upload-artifact@v4
+        with:
+          name: finra-firms-jsonl
+          path: finra-scraper/data/output/firms.jsonl
+          retention-days: 90
+
+      - name: Commit results to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add output files (not the database - too large for git)
+          mkdir -p finra-scraper/data/output
+          git add finra-scraper/data/output/ || true
+
+          if git diff --staged --quiet; then
+            echo "No new data to commit."
+          else
+            git commit -m "Add FINRA scraper results ($(date -u +%Y-%m-%d))"
+            git push origin claude/finra-scraping-plan-o7w5K
+          fi
