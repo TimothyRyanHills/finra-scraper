@@ -113,16 +113,8 @@ def main() -> None:
     # Phase 1
     if 1 in phases:
         print("\n=== Phase 1: Collecting Firm List ===")
-        if args.try_api_enumeration:
-            logger.info("Using BrokerCheck API enumeration strategy")
-            count = phase1_firm_list.run_api_enumeration(conn, delay=args.delay)
-        else:
-            logger.info("Using Playwright scraping strategy")
-            try:
-                count = phase1_firm_list.run_playwright_scrape(conn, letter=args.letter)
-            except Exception as e:
-                logger.warning("Playwright failed (%s), trying requests fallback", e)
-                count = phase1_firm_list.run_requests_scrape(conn, letter=args.letter)
+        logger.info("Using BrokerCheck API enumeration strategy")
+        count = phase1_firm_list.run_api_enumeration(conn, delay=args.delay)
         print(f"  Firms collected: {count}")
 
     # Phase 2

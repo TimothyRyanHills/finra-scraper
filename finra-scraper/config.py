@@ -19,7 +19,8 @@ MATCH_THRESHOLD = 0.85       # fuzzy match ratio for firm names
 # BrokerCheck API
 BROKERCHECK_BASE_URL = "https://api.brokercheck.finra.org"
 BROKERCHECK_SEARCH_FIRM = f"{BROKERCHECK_BASE_URL}/search/firm"
-BROKERCHECK_FIRM_DETAIL = f"{BROKERCHECK_BASE_URL}/firm"
+# Detail endpoint: /search/firm/{crd} (NOT /firm/{crd} which returns 403)
+BROKERCHECK_FIRM_DETAIL = f"{BROKERCHECK_BASE_URL}/search/firm"
 
 # FINRA directory pages
 FINRA_BASE_URL = "https://www.finra.org/about/firms-we-regulate"

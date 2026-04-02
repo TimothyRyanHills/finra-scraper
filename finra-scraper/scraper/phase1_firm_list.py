@@ -1,333 +1,229 @@
-"""Phase 1: Collect firm names and addresses from FINRA directory pages.
+"""Phase 1: Collect firm names and details from BrokerCheck API.
 
-Supports two strategies:
-  1. API enumeration via BrokerCheck (preferred -- no browser needed)
-  2. Playwright-based scraping of the alphabetical HTML pages (fallback)
+Strategy: enumerate all ACTIVE firms via 2-letter prefix queries to stay
+under the API's 9000-result pagination cap. Deduplicates by CRD number.
+The 'filter' param on FINRA's API is broken as of 2026-04, so we filter
+client-side for firm_scope == "ACTIVE".
 """
 
 import json
 import logging
-import re
+import string
 import time
 from datetime import datetime
 
-from bs4 import BeautifulSoup
-
 import db
-from config import (
-    FINRA_BASE_URL,
-    FINRA_LETTER_PAGES,
-    PLAYWRIGHT_DELAY,
-    BROWSER_HEADERS,
-)
+from config import DEFAULT_DELAY
 from models import FirmListing, FirmDetail
 from scraper.brokercheck_client import BrokerCheckClient
 
 logger = logging.getLogger(__name__)
 
-# ---------- Strategy 1: BrokerCheck API enumeration ----------
+# Pagination cap enforced by BrokerCheck API
+API_MAX_OFFSET = 9000
+PAGE_SIZE = 100
+
+# Characters to use for prefix generation
+CHARS = list(string.ascii_lowercase) + [str(d) for d in range(10)]
 
 
 def run_api_enumeration(conn, delay: float = 0.5) -> int:
-    """Enumerate all firms directly from the BrokerCheck search API.
+    """Enumerate all active firms via BrokerCheck search API.
 
-    This bypasses the FINRA HTML pages entirely. Each search hit gives us
-    both the firm listing data AND the CRD number, so we populate both
-    firm_listings and firm_details in one pass.
+    Uses 2-character prefix queries (aa, ab, ..., zz, 0-9 combos) to
+    paginate through all firms. Deduplicates by CRD and filters for
+    active firms client-side.
 
-    Returns the total number of firms found.
+    Returns total number of unique active firms found.
     """
     client = BrokerCheckClient(delay=delay)
-    total_found = 0
-    start = 0
-    page_size = 100
+    seen_crds = _get_existing_crds(conn)
+    initial_count = len(seen_crds)
+    logger.info("Starting enumeration. %d firms already in DB.", initial_count)
 
-    logger.info("Starting BrokerCheck API enumeration (page_size=%d)", page_size)
+    # Generate all 2-character prefixes: a-z + 0-9 × a-z + 0-9 + space
+    prefixes = []
+    for first in CHARS:
+        for second in CHARS + [' ']:
+            prefixes.append(first + second)
+
+    total_prefixes = len(prefixes)
+    skipped = 0
+    logger.info("Will query %d 2-char prefixes", total_prefixes)
+
+    for i, prefix in enumerate(prefixes):
+        total, new = _enumerate_prefix(client, conn, prefix, seen_crds)
+        if new > 0:
+            logger.info(
+                "[%d/%d] Prefix '%s': %d total, %d new active (cumulative: %d)",
+                i + 1, total_prefixes, prefix, total, new, len(seen_crds),
+            )
+        else:
+            skipped += 1
+
+        # Progress report every 100 prefixes
+        if (i + 1) % 100 == 0:
+            logger.info(
+                "Progress: %d/%d prefixes done, %d active firms found so far",
+                i + 1, total_prefixes, len(seen_crds),
+            )
+
+    client.close()
+    new_total = len(seen_crds) - initial_count
+    logger.info(
+        "Enumeration complete. %d new firms (%d total). %d prefixes returned no new results.",
+        new_total, len(seen_crds), skipped,
+    )
+    return len(seen_crds)
+
+
+def _get_existing_crds(conn) -> set[int]:
+    """Get CRD numbers already in the database."""
+    rows = conn.execute("SELECT crd_number FROM firm_details").fetchall()
+    return {row["crd_number"] for row in rows}
+
+
+def _enumerate_prefix(client, conn, prefix: str, seen_crds: set[int]) -> tuple[int, int]:
+    """Paginate through all results for a given query prefix.
+
+    Returns (total_results, new_firms_added).
+    """
+    start = 0
+    total = None
+    new_count = 0
+    consecutive_empty_pages = 0
 
     while True:
         try:
-            data = client.search_firm_all(start=start, count=page_size)
+            data = client.search_firm_paginated(prefix, start=start, count=PAGE_SIZE)
         except Exception as e:
-            logger.error("API enumeration failed at start=%d: %s", start, e)
-            db.log_request(conn, f"search/firm?start={start}", error=str(e))
-            conn.commit()
+            logger.error("API error for prefix '%s' at start=%d: %s", prefix, start, e)
             break
 
-        hits = _extract_hits(data)
-        total = _extract_total(data)
-
-        if not hits:
-            logger.info("No more hits at start=%d. Done.", start)
+        hits_data = data.get("hits")
+        if not hits_data or not hits_data.get("hits"):
             break
 
+        if total is None:
+            total = hits_data.get("total", 0)
+            # Skip prefixes with 0 results
+            if total == 0:
+                break
+
+        hits = hits_data["hits"]
+        page_new = 0
         for hit in hits:
-            _save_hit(conn, hit)
-            total_found += 1
+            crd, added = _save_hit(conn, hit, seen_crds)
+            if added:
+                page_new += 1
+                new_count += 1
 
         conn.commit()
-        logger.info(
-            "Enumerated %d / %d firms (start=%d)",
-            total_found,
-            total or "?",
-            start,
-        )
 
-        if total and start + page_size >= total:
+        # Early termination: if 3 consecutive pages had no new active firms,
+        # likely all remaining results for this prefix are inactive/dupes
+        if page_new == 0:
+            consecutive_empty_pages += 1
+            if consecutive_empty_pages >= 3:
+                break
+        else:
+            consecutive_empty_pages = 0
+
+        # Check if we've gotten all results or hit the API cap
+        if start + PAGE_SIZE >= min(total or 0, API_MAX_OFFSET):
             break
 
-        start += page_size
+        start += PAGE_SIZE
 
-    client.close()
-    logger.info("API enumeration complete. Total firms: %d", total_found)
-    return total_found
+    return total or 0, new_count
 
 
-def _extract_hits(data: dict) -> list[dict]:
-    """Pull the list of firm hit dicts from the API response.
-
-    The BrokerCheck response structure can vary; try common shapes.
-    """
-    # Shape 1: { "hits": { "hits": [ ... ] } }
-    if "hits" in data and isinstance(data["hits"], dict):
-        return data["hits"].get("hits", [])
-    # Shape 2: { "results": [ ... ] }
-    if "results" in data:
-        return data["results"]
-    # Shape 3: top-level list
-    if isinstance(data, list):
-        return data
-    return []
-
-
-def _extract_total(data: dict):
-    """Pull the total count from the API response."""
-    if "hits" in data and isinstance(data["hits"], dict):
-        total = data["hits"].get("total")
-        if isinstance(total, dict):
-            return total.get("value")
-        return total
-    return data.get("total")
-
-
-def _save_hit(conn, hit: dict) -> None:
-    """Persist a single search hit as both a listing and a detail record."""
+def _save_hit(conn, hit: dict, seen_crds: set[int]) -> tuple[int | None, bool]:
+    """Parse and save a single search hit. Returns (crd_number, was_new)."""
     source = hit.get("_source", hit)
 
-    name = source.get("bc_source_name") or source.get("name") or source.get("firm_name", "")
+    # Extract CRD
+    crd_raw = source.get("firm_source_id") or source.get("bc_source_id") or source.get("sourceId")
+    if crd_raw is None:
+        return None, False
+
+    crd = int(crd_raw)
+    if crd in seen_crds:
+        return crd, False
+
+    # Filter: only keep active firms
+    scope = (source.get("firm_scope") or "").upper()
+    if scope != "ACTIVE":
+        return crd, False
+
+    seen_crds.add(crd)
+
+    name = (
+        source.get("firm_name")
+        or source.get("bc_source_name")
+        or source.get("name")
+        or ""
+    ).strip()
     if not name:
-        return
+        return crd, False
 
-    # Build address from nested fields
-    main_office = {}
-    branch_locations = source.get("branchLocations", source.get("branch_locations", []))
-    if branch_locations and isinstance(branch_locations, list):
-        main_office = branch_locations[0] if branch_locations else {}
+    # Parse address from firm_address_details (JSON string)
+    street, city, state, zip_code, country = "", "", "", "", ""
+    addr_json = source.get("firm_address_details")
+    if addr_json:
+        try:
+            addr_data = json.loads(addr_json) if isinstance(addr_json, str) else addr_json
+            office = addr_data.get("officeAddress", {})
+            street = office.get("street1", "")
+            city = office.get("city", "")
+            state = office.get("state", "")
+            zip_code = office.get("postalCode", "")
+            country = office.get("country", "")
+        except (json.JSONDecodeError, AttributeError):
+            pass
 
-    address_parts = []
-    addr = main_office.get("address", {}) if isinstance(main_office, dict) else {}
-    for key in ("street", "city", "state", "zip"):
-        val = addr.get(key)
-        if val:
-            address_parts.append(str(val))
-    address = ", ".join(address_parts) if address_parts else ""
+    address_parts = [p for p in [street, city, state, zip_code] if p]
+    address = ", ".join(address_parts)
 
-    # Save as listing
+    # Save listing
     listing = FirmListing(
-        name=name.strip(),
+        name=name,
         address=address,
         source_page="api_enumeration",
         scraped_at=datetime.utcnow(),
     )
     db.upsert_listing(conn, listing)
 
-    # Save as detail (Phase 2 already done -- we have the CRD)
-    crd = source.get("bc_source_id") or source.get("sourceId") or source.get("source_id")
-    if crd is not None:
-        detail = FirmDetail(
-            crd_number=int(crd),
-            sec_number=source.get("bc_sec_number") or source.get("secNumber"),
-            name=name.strip(),
-            other_names="|".join(source.get("otherNames", [])) if isinstance(source.get("otherNames"), list) else source.get("otherNames"),
-            finra_approved_registration_count=source.get("finraApprovedRegistrationCount"),
-            number_of_branches=source.get("numberOfBranches") or source.get("number_of_branches"),
-            street=addr.get("street"),
-            city=addr.get("city"),
-            state=addr.get("state"),
-            zip_code=addr.get("zip"),
-            country=addr.get("country"),
-            latitude=(main_office.get("coordinates", {}) or {}).get("latitude"),
-            longitude=(main_office.get("coordinates", {}) or {}).get("longitude"),
-            search_response_raw=json.dumps(source),
-            matched_from_name=name.strip(),
-            match_confidence=1.0,
-            scraped_at=datetime.utcnow(),
-        )
-        db.upsert_detail(conn, detail, phase=2)
+    # Parse other names
+    other_names_list = source.get("firm_other_names", source.get("otherNames", []))
+    other_names = "|".join(other_names_list) if isinstance(other_names_list, list) else other_names_list
+
+    # Save detail (Phase 2 data — we already have CRD from search)
+    detail = FirmDetail(
+        crd_number=crd,
+        sec_number=source.get("firm_bd_sec_number") or source.get("bc_sec_number"),
+        name=name,
+        other_names=other_names,
+        finra_approved_registration_count=source.get("firm_approved_finra_registration_count"),
+        number_of_branches=source.get("firm_branches_count"),
+        street=street,
+        city=city,
+        state=state,
+        zip_code=zip_code,
+        country=country,
+        search_response_raw=json.dumps(source),
+        matched_from_name=name,
+        match_confidence=1.0,
+        scraped_at=datetime.utcnow(),
+    )
+    db.upsert_detail(conn, detail, phase=2)
+    return crd, True
 
 
-# ---------- Strategy 2: Playwright scraping ----------
+# Legacy fallback strategies kept for compatibility
 
+def run_playwright_scrape(conn, letter=None):
+    raise NotImplementedError("Use --try-api-enumeration instead")
 
-def run_playwright_scrape(conn, letter: str | None = None) -> int:
-    """Scrape firm listings from FINRA alphabetical pages using Playwright.
-
-    Args:
-        conn: SQLite connection.
-        letter: If given, scrape only this letter page (e.g. 'a'). Otherwise all.
-
-    Returns the total number of firms scraped.
-    """
-    from playwright.sync_api import sync_playwright
-
-    completed = db.get_completed_pages(conn)
-    pages_to_scrape = FINRA_LETTER_PAGES
-    if letter:
-        slug = f"firms-we-regulate-{letter.lower()}" if letter != "#" else "firms-we-regulate-no"
-        pages_to_scrape = [slug]
-
-    total = 0
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=BROWSER_HEADERS["User-Agent"],
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-        )
-        page = context.new_page()
-
-        for slug in pages_to_scrape:
-            if slug in completed:
-                logger.info("Skipping already-scraped page: %s", slug)
-                continue
-
-            url = f"{FINRA_BASE_URL}/{slug}"
-            logger.info("Scraping %s", url)
-
-            try:
-                page.goto(url, wait_until="networkidle", timeout=30000)
-                time.sleep(2)  # let dynamic content settle
-                html = page.content()
-                firms = _parse_firm_page(html, slug)
-                for firm in firms:
-                    db.upsert_listing(conn, firm)
-                    total += 1
-                conn.commit()
-                db.log_request(conn, url, status_code=200)
-                conn.commit()
-                logger.info("Parsed %d firms from %s", len(firms), slug)
-            except Exception as e:
-                logger.error("Failed to scrape %s: %s", url, e)
-                db.log_request(conn, url, error=str(e))
-                conn.commit()
-
-            time.sleep(PLAYWRIGHT_DELAY)
-
-        browser.close()
-
-    logger.info("Playwright scrape complete. Total firms: %d", total)
-    return total
-
-
-def _parse_firm_page(html: str, source_page: str) -> list[FirmListing]:
-    """Parse a FINRA alphabetical firm page into FirmListing objects."""
-    soup = BeautifulSoup(html, "html.parser")
-    firms = []
-
-    # The firm entries are in the main content area, separated by middle-dot (·)
-    # Look for the main content div
-    content = soup.find("div", class_="field--name-body") or soup.find("article") or soup.find("main")
-    if not content:
-        logger.warning("Could not find content div on %s", source_page)
-        return firms
-
-    text = content.get_text(separator="\n")
-
-    # Split by middle dot separator
-    entries = re.split(r"\s*·\s*", text)
-
-    for entry in entries:
-        entry = entry.strip()
-        if not entry or len(entry) < 5:
-            continue
-
-        # Try to separate firm name from address
-        # Pattern: FIRM NAME IN CAPS followed by address
-        # The name is typically the first line or all-caps portion
-        lines = [l.strip() for l in entry.split("\n") if l.strip()]
-        if not lines:
-            continue
-
-        name = lines[0].strip()
-        address_lines = lines[1:] if len(lines) > 1 else []
-
-        # Check for mailing address
-        mailing_address = None
-        primary_parts = []
-        for line in address_lines:
-            if line.lower().startswith("mailing address"):
-                # Everything after "Mailing Address:" is the mailing address
-                mailing_address = line.split(":", 1)[-1].strip() if ":" in line else ""
-            else:
-                primary_parts.append(line)
-
-        address = ", ".join(primary_parts)
-
-        if name:
-            firms.append(
-                FirmListing(
-                    name=name,
-                    address=address,
-                    mailing_address=mailing_address,
-                    source_page=source_page,
-                    scraped_at=datetime.utcnow(),
-                )
-            )
-
-    return firms
-
-
-# ---------- Strategy 3: Requests with browser headers (simple fallback) ----------
-
-
-def run_requests_scrape(conn, letter: str | None = None) -> int:
-    """Scrape using plain requests with full browser headers. Last resort."""
-    import requests as req
-
-    completed = db.get_completed_pages(conn)
-    pages_to_scrape = FINRA_LETTER_PAGES
-    if letter:
-        slug = f"firms-we-regulate-{letter.lower()}" if letter != "#" else "firms-we-regulate-no"
-        pages_to_scrape = [slug]
-
-    total = 0
-    session = req.Session()
-    session.headers.update(BROWSER_HEADERS)
-
-    for slug in pages_to_scrape:
-        if slug in completed:
-            continue
-
-        url = f"{FINRA_BASE_URL}/{slug}"
-        logger.info("Fetching %s via requests", url)
-
-        try:
-            resp = session.get(url, timeout=30)
-            resp.raise_for_status()
-            firms = _parse_firm_page(resp.text, slug)
-            for firm in firms:
-                db.upsert_listing(conn, firm)
-                total += 1
-            conn.commit()
-            db.log_request(conn, url, status_code=resp.status_code)
-            conn.commit()
-            logger.info("Parsed %d firms from %s", len(firms), slug)
-        except Exception as e:
-            logger.error("Requests fallback failed for %s: %s", url, e)
-            db.log_request(conn, url, error=str(e))
-            conn.commit()
-
-        time.sleep(PLAYWRIGHT_DELAY)
-
-    session.close()
-    return total
+def run_requests_scrape(conn, letter=None):
+    raise NotImplementedError("Use --try-api-enumeration instead")

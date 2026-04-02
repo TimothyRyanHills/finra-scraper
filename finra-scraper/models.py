@@ -46,6 +46,12 @@ class FirmDetail:
     disclosures_count: Optional[int] = None
     branch_locations_count: Optional[int] = None
 
+    # Additional detail fields
+    phone: Optional[str] = None
+    firm_type: Optional[str] = None
+    formed_state: Optional[str] = None
+    formed_date: Optional[str] = None
+
     # Raw JSON for future re-parsing
     search_response_raw: str = ""
     detail_response_raw: Optional[str] = None

@@ -1,4 +1,4 @@
-"""HTTP client for the undocumented BrokerCheck API with throttling and retries."""
+"""HTTP client for the BrokerCheck API with throttling and retries."""
 
 import time
 import logging
@@ -63,13 +63,14 @@ class BrokerCheckClient:
         resp.raise_for_status()
         return resp
 
-    def search_firm(
-        self, query: str, start: int = 0, count: int = 10
-    ) -> dict:
-        """Search for firms by name. Returns the raw JSON response."""
+    def search_firm(self, query: str, start: int = 0, count: int = 10) -> dict:
+        """Search for firms by name. Returns the raw JSON response.
+
+        NOTE: The 'filter' parameter is broken on FINRA's API as of 2026-04.
+        We omit it and filter client-side for active firms.
+        """
         params = {
             "query": query,
-            "filter": "action=active,type=firm",
             "hl": "true",
             "nrows": count,
             "start": start,
@@ -80,11 +81,10 @@ class BrokerCheckClient:
         resp = self._get(BROKERCHECK_SEARCH_FIRM, params=params)
         return resp.json()
 
-    def search_firm_all(self, start: int = 0, count: int = 100) -> dict:
-        """Enumerate all firms via empty-query pagination."""
+    def search_firm_paginated(self, query: str, start: int = 0, count: int = 100) -> dict:
+        """Paginate through firms for enumeration. Sorted by name for consistency."""
         params = {
-            "query": "",
-            "filter": "action=active,type=firm",
+            "query": query,
             "hl": "true",
             "nrows": count,
             "start": start,

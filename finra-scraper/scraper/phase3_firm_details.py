@@ -1,4 +1,9 @@
-"""Phase 3: Fetch comprehensive detail for each firm by CRD number."""
+"""Phase 3: Fetch comprehensive detail for each firm by CRD number.
+
+The detail endpoint is /search/firm/{crd} which returns a nested JSON
+structure with content as a JSON string containing basicInformation,
+firmAddressDetails, registrations, disclosures, etc.
+"""
 
 import json
 import logging
@@ -39,7 +44,7 @@ def run(conn, delay: float = 0.5) -> dict:
         except Exception as e:
             errors += 1
             logger.error("Error enriching CRD %d: %s", crd, e)
-            db.log_request(conn, f"firm/{crd}", error=str(e))
+            db.log_request(conn, f"search/firm/{crd}", error=str(e))
 
         batch_count += 1
         if batch_count % 10 == 0:
@@ -54,56 +59,97 @@ def run(conn, delay: float = 0.5) -> dict:
 
 
 def _update_detail(conn, crd_number: int, data: dict) -> None:
-    """Extract fields from the detail API response and update the DB record."""
-    # The detail response structure varies; try to extract from common shapes
-    firm = data
-    if "firmSummary" in data:
-        firm = data["firmSummary"]
-    elif "hits" in data:
-        hits = data["hits"]
-        if isinstance(hits, dict) and "hits" in hits:
-            hit_list = hits["hits"]
-            if hit_list:
-                firm = hit_list[0].get("_source", hit_list[0])
+    """Extract fields from the detail API response and update the DB record.
 
-    # Extract registration info
-    reg_status = firm.get("registrationStatus") or firm.get("registration_status")
-    reg_begin = firm.get("registrationBeginDate") or firm.get("registration_begin_date")
-    firm_size = firm.get("firmSize") or firm.get("firm_size")
+    The detail response structure:
+    {
+      "hits": {
+        "total": 1,
+        "hits": [{
+          "_source": {
+            "content": "{JSON string with basicInformation, firmAddressDetails, ...}"
+          }
+        }]
+      }
+    }
+    """
+    # Navigate to the content
+    content = None
+    try:
+        hits = data.get("hits", {})
+        hit_list = hits.get("hits", [])
+        if hit_list:
+            source = hit_list[0].get("_source", {})
+            content_str = source.get("content", "")
+            if content_str:
+                content = json.loads(content_str) if isinstance(content_str, str) else content_str
+    except (json.JSONDecodeError, IndexError, KeyError) as e:
+        logger.warning("Could not parse detail response for CRD %d: %s", crd_number, e)
+        return
 
-    # Disclosures
-    disclosures = firm.get("disclosures", [])
-    disclosures_count = len(disclosures) if isinstance(disclosures, list) else firm.get("disclosureCount", 0)
-    if firm.get("hasDisclosures") is False:
-        disclosures_count = 0
+    if not content:
+        logger.warning("Empty content for CRD %d", crd_number)
+        return
 
-    # Branch offices
-    branches = firm.get("branchLocations", firm.get("branch_locations", []))
-    branch_count = len(branches) if isinstance(branches, list) else firm.get("numberOfBranches")
+    basic = content.get("basicInformation", {})
+    addr_details = content.get("firmAddressDetails", {})
+    regs = content.get("registrations", {})
+    disclosures = content.get("disclosures", [])
 
-    # Address (may have better data than search)
-    main_addr = {}
-    if branches and isinstance(branches, list):
-        main_office = branches[0] if branches else {}
-        main_addr = main_office.get("address", {}) if isinstance(main_office, dict) else {}
+    # Address
+    office = addr_details.get("officeAddress", {})
+    street = office.get("street1", "")
+    city = office.get("city", "")
+    state = office.get("state", "")
+    zip_code = office.get("postalCode", "")
+    country = office.get("country", "")
 
-    name = firm.get("bc_source_name") or firm.get("name") or firm.get("firmName", "")
+    # Registration info
+    reg_status = basic.get("firmStatus")
+    reg_begin = basic.get("finraLastApprovalDate")
+    firm_size = basic.get("firmSize")
+
+    # Disclosures count
+    disclosures_count = 0
+    if isinstance(disclosures, list):
+        for d in disclosures:
+            disclosures_count += d.get("disclosureCount", 0) if isinstance(d, dict) else 0
+
+    # Branch count
+    branch_count = regs.get("approvedSRORegistrationCount")
+
+    name = basic.get("firmName") or basic.get("iaFirmName") or ""
+
+    # Other names
+    other_names_list = basic.get("otherNames", [])
+    other_names = "|".join(other_names_list) if isinstance(other_names_list, list) else other_names_list
+
+    # Additional fields
+    phone = addr_details.get("businessPhoneNumber")
+    firm_type = basic.get("firmType")
+    formed_state = basic.get("formedState")
+    formed_date = basic.get("formedDate")
 
     detail = FirmDetail(
         crd_number=crd_number,
-        sec_number=firm.get("bc_sec_number") or firm.get("secNumber"),
+        sec_number=basic.get("bdSECNumber"),
         name=name.strip() if name else "",
+        other_names=other_names,
         registration_status=reg_status,
         registration_begin_date=reg_begin,
         firm_size=firm_size,
         disclosures_count=disclosures_count,
         branch_locations_count=branch_count,
-        street=main_addr.get("street"),
-        city=main_addr.get("city"),
-        state=main_addr.get("state"),
-        zip_code=main_addr.get("zip"),
-        country=main_addr.get("country"),
-        detail_response_raw=json.dumps(data),
+        street=street,
+        city=city,
+        state=state,
+        zip_code=zip_code,
+        country=country,
+        phone=phone,
+        firm_type=firm_type,
+        formed_state=formed_state,
+        formed_date=formed_date,
+        detail_response_raw=json.dumps(content),
         scraped_at=datetime.utcnow(),
     )
     db.upsert_detail(conn, detail, phase=3)

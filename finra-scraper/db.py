@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS firm_details (
     firm_size TEXT,
     disclosures_count INTEGER,
     branch_locations_count INTEGER,
+    phone TEXT,
+    firm_type TEXT,
+    formed_state TEXT,
+    formed_date TEXT,
     search_response_raw TEXT,
     detail_response_raw TEXT,
     matched_from_name TEXT,
@@ -60,6 +64,14 @@ CREATE INDEX IF NOT EXISTS idx_firm_details_phase ON firm_details(phase);
 CREATE INDEX IF NOT EXISTS idx_firm_details_name ON firm_details(matched_from_name);
 """
 
+# Migration: add columns if they don't exist (for existing DBs)
+_MIGRATIONS = [
+    "ALTER TABLE firm_details ADD COLUMN phone TEXT",
+    "ALTER TABLE firm_details ADD COLUMN firm_type TEXT",
+    "ALTER TABLE firm_details ADD COLUMN formed_state TEXT",
+    "ALTER TABLE firm_details ADD COLUMN formed_date TEXT",
+]
+
 
 def get_or_create_db(path: Optional[str] = None) -> sqlite3.Connection:
     """Open (or create) the SQLite database and ensure tables exist."""
@@ -68,6 +80,12 @@ def get_or_create_db(path: Optional[str] = None) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    # Run migrations (ignore if columns already exist)
+    for migration in _MIGRATIONS:
+        try:
+            conn.execute(migration)
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     conn.commit()
     return conn
 
@@ -101,10 +119,11 @@ def upsert_detail(conn: sqlite3.Connection, detail: FirmDetail, phase: int) -> N
                latitude, longitude,
                registration_status, registration_begin_date,
                firm_size, disclosures_count, branch_locations_count,
+               phone, firm_type, formed_state, formed_date,
                search_response_raw, detail_response_raw,
                matched_from_name, match_confidence,
                phase, scraped_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(crd_number) DO UPDATE SET
                sec_number = COALESCE(excluded.sec_number, sec_number),
                name = excluded.name,
@@ -123,6 +142,10 @@ def upsert_detail(conn: sqlite3.Connection, detail: FirmDetail, phase: int) -> N
                firm_size = COALESCE(excluded.firm_size, firm_size),
                disclosures_count = COALESCE(excluded.disclosures_count, disclosures_count),
                branch_locations_count = COALESCE(excluded.branch_locations_count, branch_locations_count),
+               phone = COALESCE(excluded.phone, phone),
+               firm_type = COALESCE(excluded.firm_type, firm_type),
+               formed_state = COALESCE(excluded.formed_state, formed_state),
+               formed_date = COALESCE(excluded.formed_date, formed_date),
                search_response_raw = COALESCE(excluded.search_response_raw, search_response_raw),
                detail_response_raw = COALESCE(excluded.detail_response_raw, detail_response_raw),
                matched_from_name = COALESCE(excluded.matched_from_name, matched_from_name),
@@ -148,6 +171,10 @@ def upsert_detail(conn: sqlite3.Connection, detail: FirmDetail, phase: int) -> N
             detail.firm_size,
             detail.disclosures_count,
             detail.branch_locations_count,
+            detail.phone,
+            detail.firm_type,
+            detail.formed_state,
+            detail.formed_date,
             detail.search_response_raw,
             detail.detail_response_raw,
             detail.matched_from_name,
