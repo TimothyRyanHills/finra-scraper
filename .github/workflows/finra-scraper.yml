@@ -37,7 +37,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: claude/finra-scraping-plan-o7w5K
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -130,5 +130,5 @@ jobs:
             echo "No new data to commit."
           else
             git commit -m "Add FINRA scraper results ($(date -u +%Y-%m-%d))"
-            git push origin claude/finra-scraping-plan-o7w5K
+            git push origin main
           fi

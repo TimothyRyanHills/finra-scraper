@@ -2,15 +2,11 @@
 
 FINRA broker-dealer firm scraper. **First full run completed 2026-04-02 — 3,053 firms scraped.** Output is the canonical snapshot used downstream by `finra-enrichment` for CEO identification + email verification.
 
-## ⚠️ Repo housekeeping
+## Repo
 
-This local clone is on a **wrong-name remote** and a **non-default branch**:
-
-- Remote: `git@github.com:TimothyRyanHills/test-repo-1738098343442.git` (generic test name from a Claude Web session)
-- Branch: `claude/finra-scraping-plan-o7w5K`
-- Workflow: GitHub Actions in this repo runs the scraper
-
-This needs cleanup — the canonical home should be `TimothyRyanHills/finra-scraper`, branch `main`. Until then, **do not assume this lives where you'd expect**.
+- **Remote:** `git@github.com:TimothyRyanHills/finra-scraper.git`
+- **Branch:** `main`
+- **Workflow:** GitHub Actions in this repo runs the scraper (`workflow_dispatch` trigger)
 
 ## File layout
 
@@ -30,8 +26,9 @@ finra-scraper-repo/             ← git root (this directory)
         firms.csv               ← 3,053 firms, 984 KB ← canonical
         firms.json              ← 12 MB
         firms.jsonl             ← 12 MB
-  finra_scrape.log              ← scrape log
-  README.md                     ← stub ("test-repo-1738098343442")
+  finra_scrape.log              ← scrape log (gitignored)
+  README.md
+  .github/workflows/finra-scraper.yml   ← workflow_dispatch runner
 ```
 
 ## Output snapshot (2026-04-02)
@@ -60,12 +57,12 @@ scraped_at
 
 The scraper runs as a **GitHub Actions workflow**, not locally.
 
-1. Open `TimothyRyanHills/test-repo-1738098343442` in GitHub
+1. Open `TimothyRyanHills/finra-scraper` in GitHub
 2. Actions tab → "FINRA Scraper" workflow
-3. Run workflow dropdown → pick branch `claude/finra-scraping-plan-o7w5K`
+3. Run workflow dropdown → branch `main`
 4. Settings: API enumeration, all phases, 0.5s delay (defaults are fine)
 5. ~37 min for the full ~3K firm enumeration
-6. Artifacts auto-commit back to the branch + CSV/JSON/JSONL/SQLite saved as workflow artifacts
+6. Artifacts auto-commit back to `main` + CSV/JSON/JSONL/SQLite saved as workflow artifacts
 
 **Triggerable from phone** via the GitHub Actions UI — that's why this is a workflow rather than a server cron.
 
