@@ -6,6 +6,8 @@ import sqlite3
 from datetime import datetime
 from typing import Optional
 
+from scraper_lib.db_helpers import get_connection as _sl_get_connection
+
 from config import DB_PATH, DATA_DIR
 from models import FirmDetail, FirmListing
 
@@ -74,16 +76,16 @@ _MIGRATIONS = [
 
 
 def get_or_create_db(path: Optional[str] = None) -> sqlite3.Connection:
-    """Open (or create) the SQLite database and ensure tables exist."""
+    """Open (or create) the SQLite database and ensure tables exist.
+
+    Connection setup (WAL, foreign_keys=ON, row_factory=Row) is delegated
+    to scraper_lib.db_helpers.get_connection, which also adds safer
+    defaults (synchronous=NORMAL — SQLite's WAL default — plus 60s Python
+    timeout and 60s busy_timeout). Schema creation and ALTER migrations
+    stay here.
+    """
     path = path or DB_PATH
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    # Enable WAL for concurrent reader/writer safety (matches every other
-    # SQLite project on this server). Without WAL, writers block readers
-    # and there's a corruption window during the workflow's commit step.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn = _sl_get_connection(path, row_factory=sqlite3.Row)
     conn.executescript(_SCHEMA)
     # Run migrations (ignore if columns already exist)
     for migration in _MIGRATIONS:
