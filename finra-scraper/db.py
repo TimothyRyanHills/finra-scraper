@@ -79,6 +79,11 @@ def get_or_create_db(path: Optional[str] = None) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    # Enable WAL for concurrent reader/writer safety (matches every other
+    # SQLite project on this server). Without WAL, writers block readers
+    # and there's a corruption window during the workflow's commit step.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)
     # Run migrations (ignore if columns already exist)
     for migration in _MIGRATIONS:
